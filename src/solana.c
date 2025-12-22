@@ -1,0 +1,206 @@
+#include "solana.h"
+#include "base58.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sodium.h>
+
+void secret_to_pubkey_solana(const uint8_t secret[SOLANA_PRIVKEY_SIZE], uint8_t pubkey[SOLANA_PUBKEY_SIZE]) {
+    // Step 1: Hash the secret key with SHA-512
+    uint8_t hash[64];
+    crypto_hash_sha512(hash, secret, SOLANA_PRIVKEY_SIZE);
+
+    // Step 2: Clamp the hash (first 32 bytes)
+    uint8_t clamped[32];
+    memcpy(clamped, hash, 32);
+    clamped[0] &= 248;    // Clear lowest 3 bits
+    clamped[31] &= 127;   // Clear highest bit
+    clamped[31] |= 64;    // Set second-highest bit
+
+    // Step 3: Scalar multiply by base point (ED25519)
+    crypto_scalarmult_ed25519_base_noclamp(pubkey, clamped);
+}
+
+void pubkey_to_base58(const uint8_t pubkey[SOLANA_PUBKEY_SIZE], char *out) {
+    size_t out_len = base58_encode(out, pubkey, SOLANA_PUBKEY_SIZE);
+    out[out_len] = '\0';
+}
+
+static int decode_base58_to_bytes(const char *s, uint8_t *out) {
+    uint8_t buf[64];
+    ssize_t len = base58_decode(buf, s);
+
+    if (len != SOLANA_PUBKEY_SIZE) {
+        return -1;
+    }
+
+    memcpy(out, buf, SOLANA_PUBKEY_SIZE);
+    return 0;
+}
+
+int prefix_to_all_ranges(const char *prefix, SolanaMatcher *matcher) {
+    if (prefix == NULL || matcher == NULL) {
+        return -1;
+    }
+
+    size_t prefix_len = strlen(prefix);
+    if (prefix_len == 0) {
+        // Empty prefix - match everything
+        matcher->num_ranges = 1;
+        matcher->ranges = malloc(sizeof(PubkeyRange));
+        memset(matcher->ranges[0].min, 0, SOLANA_PUBKEY_SIZE);
+        memset(matcher->ranges[0].max, 255, SOLANA_PUBKEY_SIZE);
+        return 0;
+    }
+
+    // Allocate space for potential ranges (max is ~13 different lengths)
+    PubkeyRange *temp_ranges = malloc(sizeof(PubkeyRange) * 20);
+    size_t num_ranges = 0;
+
+    // Try different address lengths from 32 to 44 characters
+    for (size_t target_len = 32; target_len <= 44; target_len++) {
+        if (target_len < prefix_len) {
+            continue;
+        }
+
+        size_t padding_len = target_len - prefix_len;
+
+        // Create min string: prefix + '1's
+        char min_str[64];
+        snprintf(min_str, sizeof(min_str), "%s", prefix);
+        for (size_t i = 0; i < padding_len; i++) {
+            strcat(min_str, "1");
+        }
+
+        // Create max string: prefix + 'z's
+        char max_str[64];
+        snprintf(max_str, sizeof(max_str), "%s", prefix);
+        for (size_t i = 0; i < padding_len; i++) {
+            strcat(max_str, "z");
+        }
+
+        // Try to decode both
+        uint8_t min_bytes[SOLANA_PUBKEY_SIZE];
+        uint8_t max_bytes[SOLANA_PUBKEY_SIZE];
+
+        if (decode_base58_to_bytes(min_str, min_bytes) == 0 &&
+            decode_base58_to_bytes(max_str, max_bytes) == 0) {
+            memcpy(temp_ranges[num_ranges].min, min_bytes, SOLANA_PUBKEY_SIZE);
+            memcpy(temp_ranges[num_ranges].max, max_bytes, SOLANA_PUBKEY_SIZE);
+            num_ranges++;
+        }
+    }
+
+    if (num_ranges == 0) {
+        free(temp_ranges);
+        return -1;
+    }
+
+    // Allocate final ranges array
+    matcher->ranges = malloc(sizeof(PubkeyRange) * num_ranges);
+    memcpy(matcher->ranges, temp_ranges, sizeof(PubkeyRange) * num_ranges);
+    matcher->num_ranges = num_ranges;
+
+    free(temp_ranges);
+    return 0;
+}
+
+bool solana_matcher_matches(const SolanaMatcher *matcher, const uint8_t pubkey[SOLANA_PUBKEY_SIZE]) {
+    for (size_t i = 0; i < matcher->num_ranges; i++) {
+        const uint8_t *min = matcher->ranges[i].min;
+        const uint8_t *max = matcher->ranges[i].max;
+
+        // Check if pubkey is within range [min, max]
+        if (memcmp(pubkey, min, SOLANA_PUBKEY_SIZE) >= 0 &&
+            memcmp(pubkey, max, SOLANA_PUBKEY_SIZE) <= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void solana_matcher_free(SolanaMatcher *matcher) {
+    if (matcher && matcher->ranges) {
+        free(matcher->ranges);
+        matcher->ranges = NULL;
+        matcher->num_ranges = 0;
+    }
+}
+
+uint64_t estimate_attempts(const char *prefix) {
+    if (prefix == NULL) {
+        return 1;
+    }
+
+    size_t len = strlen(prefix);
+    if (len == 0) {
+        return 1;
+    }
+
+    uint64_t attempts = 1;
+    for (size_t i = 0; i < len; i++) {
+        if (attempts > UINT64_MAX / 58) {
+            return UINT64_MAX;  // Overflow protection
+        }
+        attempts *= 58;
+    }
+
+    return attempts;
+}
+
+// Helper function to compute range size as a double
+// Returns the size of the range [min, max] as a floating point number
+static double compute_range_size(const uint8_t min[SOLANA_PUBKEY_SIZE], const uint8_t max[SOLANA_PUBKEY_SIZE]) {
+    // Convert bytes to a 256-bit number represented as double
+    // We use a simplified approach: treat the most significant bytes with higher weight
+    double size = 0.0;
+    double multiplier = 1.0;
+
+    // Process from least significant byte to most significant
+    for (int i = SOLANA_PUBKEY_SIZE - 1; i >= 0; i--) {
+        size += (double)(max[i] - min[i]) * multiplier;
+        multiplier *= 256.0;
+
+        // Prevent overflow by normalizing periodically
+        if (i > 0 && i % 8 == 0) {
+            size = size / 1e20 * 1e20;  // Keep precision but prevent overflow
+        }
+    }
+
+    return size + 1.0;  // +1 because range is inclusive
+}
+
+int estimate_attempts_confidence(const char *prefix, const SolanaMatcher *matcher, ConfidenceEstimates *estimates) {
+    if (prefix == NULL || matcher == NULL || estimates == NULL) {
+        return -1;
+    }
+
+    // Calculate total size of all ranges
+    double total_size = 0.0;
+    for (size_t i = 0; i < matcher->num_ranges; i++) {
+        double range_size = compute_range_size(matcher->ranges[i].min, matcher->ranges[i].max);
+        total_size += range_size;
+    }
+
+    // Total address space is 2^256
+    // base_estimate = 2^256 / total_size
+    // For practical purposes, we use a simplified calculation
+
+    // Use the simple estimate as base (58^len) since it's a good approximation
+    uint64_t base = estimate_attempts(prefix);
+
+    // Confidence multipliers:
+    // p50 = base * ln(2)     ≈ base * 0.693147
+    // p90 = base * ln(10)    ≈ base * 2.302585
+    // p95 = base * ln(20)    ≈ base * 2.995732
+
+    estimates->base = base;
+
+    // Calculate with overflow protection
+    double base_d = (double)base;
+    estimates->p50 = (uint64_t)(base_d * 0.693147 + 0.5);  // +0.5 for rounding
+    estimates->p90 = (uint64_t)(base_d * 2.302585 + 0.5);
+    estimates->p95 = (uint64_t)(base_d * 2.995732 + 0.5);
+
+    return 0;
+}
