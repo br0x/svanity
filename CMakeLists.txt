@@ -8,6 +8,20 @@ find_package(OpenCL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED libsodium)
 
+# --- ADDED FOR GMP ---
+# Most Linux distros provide a pkg-config for gmp. 
+# If not, we fallback to finding the library manually.
+pkg_check_modules(GMP gmp)
+if(NOT GMP_FOUND)
+    find_path(GMP_INCLUDE_DIRS NAMES gmp.h)
+    find_library(GMP_LIBRARIES NAMES gmp)
+endif()
+
+if(NOT GMP_LIBRARIES)
+    message(FATAL_ERROR "GMP library not found")
+endif()
+# ---------------------
+
 # Read OpenCL kernel and generate header
 file(READ "${CMAKE_SOURCE_DIR}/src/opencl/entry.cl" OPENCL_KERNEL_SOURCE)
 # Escape quotes and backslashes for C string
@@ -28,6 +42,7 @@ const char* opencl_kernel_source = \"${OPENCL_KERNEL_SOURCE}\";
 # Include directories
 include_directories(${OpenCL_INCLUDE_DIRS})
 include_directories(${SODIUM_INCLUDE_DIRS})
+include_directories(${GMP_INCLUDE_DIRS})
 include_directories(${CMAKE_BINARY_DIR})
 
 # Source files
@@ -47,6 +62,7 @@ add_executable(svanity ${SOURCES})
 target_link_libraries(svanity
     ${OpenCL_LIBRARIES}
     ${SODIUM_LIBRARIES}
+    ${GMP_LIBRARIES}
     pthread
     m
 )

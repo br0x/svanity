@@ -112,10 +112,10 @@ int main(int argc, char *argv[]) {
 
         // Print estimated attempts with confidence intervals
         ConfidenceEstimates estimates;
-        if (estimate_attempts_confidence(prefix_str, &matcher, &estimates) == 0) {
+        if (get_estimates_gmp(&matcher, &estimates) == 0) {
             fprintf(stderr, "Estimated total attempts:\n");
-            fprintf(stderr, "  %lu (50%%), %lu (90%%), %lu (95%%)\n\n",
-                    estimates.p50, estimates.p90, estimates.p95);
+            fprintf(stderr, "  %lu (50%%), %lu (90%%), %lu (99%%)\n\n",
+                    estimates.p50, estimates.p90, estimates.p99);
         } else {
             // Fallback to simple estimate
             uint64_t estimated = estimate_attempts(prefix_str);

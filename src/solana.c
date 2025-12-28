@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sodium.h>
+#include <gmp.h>
+#include <stdint.h>
+#include <stddef.h>
 
 void secret_to_pubkey_solana(const uint8_t secret[SOLANA_PRIVKEY_SIZE], uint8_t pubkey[SOLANA_PUBKEY_SIZE]) {
     // Step 1: Hash the secret key with SHA-512
@@ -148,59 +151,59 @@ uint64_t estimate_attempts(const char *prefix) {
     return attempts;
 }
 
-// Helper function to compute range size as a double
-// Returns the size of the range [min, max] as a floating point number
-static double compute_range_size(const uint8_t min[SOLANA_PUBKEY_SIZE], const uint8_t max[SOLANA_PUBKEY_SIZE]) {
-    // Convert bytes to a 256-bit number represented as double
-    // We use a simplified approach: treat the most significant bytes with higher weight
-    double size = 0.0;
-    double multiplier = 1.0;
+// Helper to calculate n = (P * 2^256) / S using GMP long math
+static uint64_t calculate_n_gmp_internal(mpz_t S, uint64_t P_fixed) {
+    if (mpz_sgn(S) == 0) return 0;
 
-    // Process from least significant byte to most significant
-    for (int i = SOLANA_PUBKEY_SIZE - 1; i >= 0; i--) {
-        size += (double)(max[i] - min[i]) * multiplier;
-        multiplier *= 256.0;
+    mpz_t P, numerator, quotient;
+    mpz_inits(P, numerator, quotient, NULL);
 
-        // Prevent overflow by normalizing periodically
-        if (i > 0 && i % 8 == 0) {
-            size = size / 1e20 * 1e20;  // Keep precision but prevent overflow
-        }
-    }
+    // 1. Set P as the unsigned fixed-point value
+    mpz_set_ui(P, P_fixed);
 
-    return size + 1.0;  // +1 because range is inclusive
+    // 2. numerator = P * 2^256 (equivalent to P << 256)
+    mpz_mul_2exp(numerator, P, 192);
+
+    // 3. quotient = numerator / S
+    mpz_tdiv_q(quotient, numerator, S);
+
+    // 4. Convert result to uint64_t
+    uint64_t result;
+    // if (mpz_fits_ulong_p(quotient)) {
+        result = (uint64_t)mpz_get_ui(quotient);
+    // } else {
+    //     // If S is so small that the quotient exceeds 64 bits
+    //     result = 0xFFFFFFFFFFFFFFFFULL;
+    // }
+
+    mpz_clears(P, numerator, quotient, NULL);
+    return result;
 }
 
-int estimate_attempts_confidence(const char *prefix, const SolanaMatcher *matcher, ConfidenceEstimates *estimates) {
-    if (prefix == NULL || matcher == NULL || estimates == NULL) {
-        return -1;
-    }
+int get_estimates_gmp(SolanaMatcher *matcher, ConfidenceEstimates *ce) {
+    mpz_t S, temp_min, temp_max, diff;
+    mpz_inits(S, temp_min, temp_max, diff, NULL);
+    mpz_set_ui(S, 0);
 
-    // Calculate total size of all ranges
-    double total_size = 0.0;
+    // Calculate Total Size S = sum(max - min)
     for (size_t i = 0; i < matcher->num_ranges; i++) {
-        double range_size = compute_range_size(matcher->ranges[i].min, matcher->ranges[i].max);
-        total_size += range_size;
+        // mpz_import: 32 bytes, order -1 (little-endian), 
+        // size 1 (byte-wise), endian 0 (native), nails 0
+        mpz_import(temp_min, 32, 1, 1, 0, 0, matcher->ranges[i].min);
+        mpz_import(temp_max, 32, 1, 1, 0, 0, matcher->ranges[i].max);
+
+        mpz_sub(diff, temp_max, temp_min);
+        mpz_add_ui(diff, diff, 1); // +1 for inclusive range
+        mpz_add(S, S, diff);
     }
 
-    // Total address space is 2^256
-    // base_estimate = 2^256 / total_size
-    // For practical purposes, we use a simplified calculation
+    // Calculate probabilities using the single S value
+    // Note: 2^64 is 100%, so P values are fractions of 2^64
+    ce->p50  = calculate_n_gmp_internal(S, 0x8000000000000000ULL); // 50%
+    ce->p90  = calculate_n_gmp_internal(S, 0xE666666666666666ULL); // 90%
+    ce->p99  = calculate_n_gmp_internal(S, 0xfd70a3d70a3d70a3ULL); // 99%
 
-    // Use the simple estimate as base (58^len) since it's a good approximation
-    uint64_t base = estimate_attempts(prefix);
-
-    // Confidence multipliers:
-    // p50 = base * ln(2)     ≈ base * 0.693147
-    // p90 = base * ln(10)    ≈ base * 2.302585
-    // p95 = base * ln(20)    ≈ base * 2.995732
-
-    estimates->base = base;
-
-    // Calculate with overflow protection
-    double base_d = (double)base;
-    estimates->p50 = (uint64_t)(base_d * 0.693147 + 0.5);  // +0.5 for rounding
-    estimates->p90 = (uint64_t)(base_d * 2.302585 + 0.5);
-    estimates->p95 = (uint64_t)(base_d * 2.995732 + 0.5);
-
+    // Clean up
+    mpz_clears(S, temp_min, temp_max, diff, NULL);
     return 0;
 }

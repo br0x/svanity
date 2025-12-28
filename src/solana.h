@@ -14,10 +14,9 @@ typedef struct {
 } PubkeyRange;
 
 typedef struct {
-    uint64_t base;
     uint64_t p50;
     uint64_t p90;
-    uint64_t p95;
+    uint64_t p99;
 } ConfidenceEstimates;
 
 typedef struct {
@@ -38,5 +37,7 @@ void solana_matcher_free(SolanaMatcher *matcher);
 uint64_t estimate_attempts(const char *prefix);
 
 int estimate_attempts_confidence(const char *prefix, const SolanaMatcher *matcher, ConfidenceEstimates *estimates);
+
+int get_estimates_gmp(SolanaMatcher *matcher, ConfidenceEstimates *ce);
 
 #endif
